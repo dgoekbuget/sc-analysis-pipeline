@@ -1,0 +1,588 @@
+---
+title: "scRNA-seq and scATAC-seq Analysis and Integration"
+author: "Deniz Goekbuget"
+date: "2024-01-15"
+output: html_notebook
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo=T) 
+```
+
+# Task 1:
+
+## 1. Defining input data
+
+A balanced cohort at the level of sex, disease state and single cell assay type will be randomly selected from full dataset. Metadata will be exported as `samplesheet.tab`. In addition, `aggr.rna` and `aggr.atac` samplesheets will be generated for later steps.
+
+```{r, echo=T,results='hide',fig.keep='all'}
+#Load libraries
+library(dplyr)
+
+#Load ncbi meta data
+setwd("/blellochlab/data1/deniz/analysis/")
+dat <- read.csv("./becker2022-meta.csv") #Download metadata sheet from NCBI Geo for Becker et al 2022 Nat Gen.
+dat$ID <- 1:nrow(dat)
+
+#Combine redundant disease columns
+dat$disease_state[90:nrow(dat)] <- dat$disease_stage[90:nrow(dat)]
+
+#Sample balanced subset of Becker et al 2022 Nat Genetics dataset
+set.seed(123)
+dat <- dat  %>%
+  group_by(tissue, disease_state, sex, Assay.Type) %>% filter(disease_state=="CRC" | disease_state=="Unaffected") %>%
+  sample_n(1, replace = FALSE)
+
+#Generate meta data sample sheet
+output <- tibble("SRR_ID"=dat$Run,"Sex"=dat$sex,"Disease_State"=dat$disease_state, "Assay"=dat$Assay.Type,
+                     "Fastq_1"=paste0("/blellochlab/data1/deniz/analysis//",dat$Run,"_S1_L001_R1_001.fastq.gz"),
+                     "Fastq_2"=paste0("/blellochlab/data1/deniz/analysis//",dat$Run,"_S1_L001_R2_001.fastq.gz")
+)
+
+write.table(output,file="./samplesheet.tab",sep="\t",quote=F,row.names = F)
+
+#Generate cellranger aggregation sample sheet
+ind <- output$Assay == "RNA-Seq"
+aggr.rna <- tibble("sample_id"=output[ind,]$SRR_ID,
+                   "molecule_h5"=paste0("/blellochlab/data1/deniz/analysis//",output[ind,]$SRR_ID,"/outs/molecule_info.h5"))
+write.csv(aggr.rna,file="./aggr-rna.csv",quote=F,row.names = F)
+
+aggr.atac <- tibble("library_id"=output[!ind,]$SRR_ID,
+                    "fragments"=paste0("/blellochlab/data1/deniz/analysis//",output[!ind,]$SRR_ID,"/outs/fragments.tsv.gz"),
+                    "cells"=paste0("/blellochlab/data1/deniz/analysis//",output[!ind,]$SRR_ID,"/outs/singlecell.csv"))
+write.csv(aggr.atac,file="./aggr-atac.csv",quote=F,row.names = F)
+```
+
+## 2. Dowload raw data from NCBI Geo
+
+Raw data defined in `samplesheet.tab` will be downloaded from database and then renamed according to Illumina standards as a prerequisite for `cellranger` analysis.
+
+```{bash}
+#!/bin/bash
+#SBATCH --mem=72G
+#SBATCH --time=72:00:00
+#SBATCH --cpus-per-task=12
+#SBATCH --gres=scratch:200G
+
+#Define variables and extract SRR IDs from samplesheet
+workdir="$1"
+samplesheet="$2"
+samples="$workdir"/"$samplesheet"
+files=($(awk '{print $1}' $samples ))
+infile="${files[$SLURM_ARRAY_TASK_ID]}"  #Parallel download of files using slurm batch array submission
+echo "Downloading SRR accession: $infile"
+
+#Activate conda environment for fasterq-dump (SRA toolkit)
+source ~/miniconda3/etc/profile.d/conda.sh
+conda activate chipseq
+
+fastq-dump --split-files --gzip --outdir "$workdir"/fastq "$infile"
+
+#Name RNA-seq and ATAC-seq files according to Illumina convention
+while read -r col1 col2 col3 col4 rest; do
+    if [ "$col1" == "$infile" ] && [ "$col4" == "RNA-Seq" ]; then
+        mv "$workdir"/fastq/"$infile"_2.fastq.gz "$workdir"/fastq/"$infile"_S1_L001_R2_001.fastq.gz
+	mv "$workdir"/fastq/"$infile"_1.fastq.gz "$workdir"/fastq/"$infile"_S1_L001_R1_001.fastq.gz
+        mv "$workdir"/fastq/"$infile"_3.fastq.gz "$workdir"/fastq/"$infile"_S1_L001_I2_001.fastq.gz
+    fi
+done < $samples
+
+while read -r col1 col2 col3 col4 rest; do
+    if [ "$col1" == "$infile" ] && [ "$col4" == "ATAC-seq" ]; then
+       mv "$workdir"/fastq/"$infile"_1.fastq.gz "$workdir"/fastq/"$infile"_S1_L001_I1_001.fastq.gz
+       mv "$workdir"/fastq/"$infile"_2.fastq.gz "$workdir"/fastq/"$infile"_S1_L001_R1_001.fastq.gz
+       mv "$workdir"/fastq/"$infile"_3.fastq.gz "$workdir"/fastq/"$infile"_S1_L001_I2_001.fastq.gz
+       mv "$workdir"/fastq/"$infile"_4.fastq.gz "$workdir"/fastq/"$infile"_S1_L001_R2_001.fastq.gz
+    fi
+done < $samples
+
+#fasterq-dump "$infile" --outdir "$workdir"/fastq --progress --temp "$workdir"  
+#gzip "$workdir"/fastq/"$infile"_{1,2}.fastq
+#mv "$workdir"/fastq/"$infile"_1.fastq.gz "$workdir"/fastq/"$infile"_S1_L001_R1_001.fastq.gz
+#mv "$workdir"/fastq/"$infile"_2.fastq.gz "$workdir"/fastq/"$infile"_S1_L001_R2_001.fastq.gz
+
+conda deactivate
+```
+
+## 3a. Parallel transcript mapping of individual scRNA experiments
+
+Individual 10x scRNA experiments will be mapped with `cellranger count`.
+
+```{bash}
+#!/bin/bash
+#SBATCH --mem=72G
+#SBATCH --time=72:00:00
+#SBATCH --cpus-per-task=24
+#SBATCH --gres=scratch:200G
+
+#Define variables and extract SRR IDs from samplesheet
+cellranger="/c4/home/gdeniz/cellranger-7.2.0/cellranger"
+transcript="/blellochlab/data1/deniz/genomes/refdata-gex-GRCh38-and-mm10-2020-A/"
+targetcells=9000
+workdir="$1"
+samplesheet="$2"
+samples="$workdir"/"$samplesheet"
+files=($(awk '{if ($4=="RNA-Seq") {print $1}}' $samples ))
+infile="${files[$SLURM_ARRAY_TASK_ID]}"  #Run cellranger on each sample individually. Note zero indexed bash array meaning first sample is zero.
+echo "Running cellranger on sample: $infile"
+
+"$cellranger" count --id "$infile" --transcriptome "$transcript" --fastqs "$workdir"/fastq --sample "$infile" --expect-cells "$targetcells" --localcores 24 --localmem 72
+```
+
+## 3b. Aggregating of individually mapped scRNA experiments
+
+`cellranger count` results will be mapped using the `cellranger aggr`function using the paths defined in `aggr.rna`.
+
+```{bash}
+#!/bin/bash
+#SBATCH --mem=96G
+#SBATCH --time=72:00:00
+#SBATCH --cpus-per-task=24
+#SBATCH --gres=scratch:200G
+
+#Define variables and extract SRR IDs from samplesheet
+cellranger="/c4/home/gdeniz/cellranger-7.2.0/cellranger"
+workdir="$1"
+samplesheet="$2"
+name="$3"
+samples="$workdir"/"$samplesheet"
+
+echo "Aggregating samples"
+
+"$cellranger" aggr --id "$name" --csv "$samples" --localmem 96 --localcores 24
+```
+
+## 4. Seurat analysis of scRNA-seq data
+
+The output of `cellranger aggr` function will be loaded into R using `Seurat`.
+
+```{r, echo=T,results='hide',fig.keep='all'}
+# Load packages and data
+library(Seurat)
+library(SeuratDisk)
+library(dplyr)
+library(patchwork)
+library(harmony)
+library(ggplot2)
+library(DoubletFinder)
+library(gridExtra)
+
+#Load meta data
+wd <- "/blellochlab/data1/deniz/analysis/"
+meta <- read.table(file.path(wd,"samplesheet.tab"),header = T)
+meta_rna <- meta[meta$Assay=="RNA-Seq",]
+
+file_rna <- file.path(wd,"scRNA-aggr/outs/count/filtered_feature_bc_matrix")
+input_rna <- Read10X(file_rna)
+
+#Remove mm10___ prefix
+input_rna@Dimnames[[1]] <- gsub("GRCh38_","",input_rna@Dimnames[[1]])
+
+#Create Seurat object
+dat <- CreateSeuratObject(counts = input_rna, project = "CRC", min.cells = 3, min.features = 200)
+
+#Add sample information to data
+dat@meta.data$sample <- NULL
+dat@meta.data$sample[grepl("-1",rownames(dat@meta.data))] <- meta_rna$SRR_ID[1]
+dat@meta.data$sample[grepl("-2",rownames(dat@meta.data))] <- meta_rna$SRR_ID[2]
+dat@meta.data$sample[grepl("-3",rownames(dat@meta.data))] <- meta_rna$SRR_ID[3]
+dat@meta.data$sample[grepl("-4",rownames(dat@meta.data))] <- meta_rna$SRR_ID[4]
+
+dat@meta.data$disease <- NULL
+dat@meta.data$disease[grepl("-1",rownames(dat@meta.data))] <- meta_rna$Disease_State[1]
+dat@meta.data$disease[grepl("-2",rownames(dat@meta.data))] <- meta_rna$Disease_State[2]
+dat@meta.data$disease[grepl("-3",rownames(dat@meta.data))] <- meta_rna$Disease_State[3]
+dat@meta.data$disease[grepl("-4",rownames(dat@meta.data))] <- meta_rna$Disease_State[4]
+
+#Add doublet class using doubleFinder to meta data
+dat@meta.data$doublet.class <- NA
+for (i in unique(dat@meta.data$sample)) {
+  ind <- dat@meta.data$sample==i
+  input.sr <- dat[,ind]
+  input.sr[["percent.mt"]] <- PercentageFeatureSet(input.sr, pattern = "^MT-")
+  input.sr <- subset(input.sr, subset = nFeature_RNA > 400 & nFeature_RNA < 5000)
+  input.sr <- NormalizeData(input.sr) %>% FindVariableFeatures() %>% ScaleData() %>% RunPCA()
+  input.sr <- RunUMAP(input.sr, dims = 1:20)
+  nExp_poi <- round(0.08*nrow(input.sr@meta.data)*nrow(input.sr@meta.data)/10000)  ## Assuming 7.5% doublet formation rate - tailor for your dataset
+  input.sr <- doubletFinder(input.sr, PCs = 1:20, pN = 0.25, pK = 0.09, nExp = nExp_poi, reuse.pANN = FALSE, sct = FALSE)
+  ind2 <- rownames(dat@meta.data) %in% rownames(input.sr@meta.data)
+  dat@meta.data$doublet.class[ind2] <- input.sr@meta.data[,ncol(input.sr@meta.data)]
+}
+rm(input.sr,ind,nExp_poi,ind2)
+
+#Remove mouse genes
+mouse <- grepl("mm10-",rownames(dat))
+dat <- dat[!mouse,]
+
+## Compute and store mtDNA percentage QC measure
+dat[["percent.mt"]] <- PercentageFeatureSet(dat, pattern = "^MT-")
+
+## Evaluate QC metrics by sample
+VlnPlot(dat, features = c("nFeature_RNA", "nCount_RNA", "percent.mt"), ncol = 3,group.by = "sample",pt.size=F)
+```
+
+```{r, echo=T,results='hide',fig.keep='all'}
+## Visualize feature-feature relationships
+## Determine cutoffs to remove mitochondrial DNA enriched low quality cells
+plot1 <- FeatureScatter(dat, feature1 = "nFeature_RNA", feature2 = "percent.mt") + geom_abline(intercept = 10, slope=0, linetype="dotted")
+plot2 <- FeatureScatter(dat, feature1 = "nCount_RNA", feature2 = "nFeature_RNA")
+plot1 + plot2
+```
+
+
+```{r, echo=T,results='hide',fig.keep='all'}
+## Remove unwanted cells
+dat <- subset(dat, subset = percent.mt < 10 & nFeature_RNA > 400 & nFeature_RNA < 5000)
+
+## Remove doublets
+dat <- dat[,dat@meta.data$doublet.class=="Singlet"]
+
+## Run normalization, find variable features, scaling, PCA
+dat <- NormalizeData(dat) %>% FindVariableFeatures() %>% ScaleData() %>% RunPCA()
+
+## Harmony batch correction
+dat <- RunHarmony(dat, group.by.vars = "sample")
+
+# Determine dimensionality
+## Jack Straw plot can be used in addition
+ElbowPlot(dat,ndims=50) + geom_vline(xintercept = c(9,19,26), linetype="dotted")
+```
+```{r, echo=T,results='hide',fig.keep='all'}
+# Run UMAP
+## 9 PCs - results should be confirmed with various PC choices
+dat <- RunUMAP(dat, reduction = "harmony", dims = 1:9)
+
+## Call clusters
+set.seed(123)
+dat <- FindNeighbors(dat, dims = 1:9) %>% FindClusters()
+
+# Plot
+## Choose colors
+set.seed(234)
+divcolors = grDevices::colors()[grep('gr(a|e)y', grDevices::colors(), invert = T)]
+colors4 <- sample(divcolors,4)
+colors23 <- sample(divcolors,23)
+
+plot1 <- DimPlot(dat, group.by = c("sample"), pt.size = 0.5, label=T,cols = colors23,order=T) + NoLegend()
+plot2 <- DimPlot(dat, group.by = c("disease"), pt.size = 0.5, label=T,cols = colors23,order=T) + NoLegend()
+plot1+plot2
+```
+```{r, echo=T,results='hide',fig.keep='all'}
+DimPlot(dat, label=T, pt.size = 0.5, cols = colors23) + NoLegend()
+```
+
+
+```{r, echo=T,results='hide',fig.keep='all'}
+#Cluster annotation
+##Stromal markers
+stromal <- list(
+Fibroblasts = c("COL1A1", "COL1A2", "COL6A1", "COL6A2", "FAP", "CBLN2", "SPOCK1", "ACSS3"),
+Fibroblasts_cell_subtypes = c("RSPO3", "CCL11", "WNT5B", "BMP4", "CHI3L1", "ACTA2", "WNT2B"),
+Myofibroblasts = c("SYT10", "SOSTDC1", "DES", "MYH11", "TAGLN", "ACTA2", "TPM4"),
+stromal_other = c("FAM110D", "INHBB", "NPR1", "NOVA2", "GPIHBP1", "SOX17", "VWF", "PLVAP", "CDH5", "S100B"),
+Pericytes = c("MCAM", "COX4I2", "KCNJ8", "HIGD1B", "RGS5", "NOTCH3", "HEYL", "FAM162B"),
+Microvascular = c("PLVAP","CD36","DYSF","NRP1","SH3BP5","EXOC3L2","FABP5","VWA1","BAALC","PRSS23","RAPGEF4","APLN","HTRA1"),
+SchwannCell = c("S100A1", "SOX10", "EGR2", "MBP", "MPZ", "GAP43", "NCAM", "P75NTR"),
+Nerve = c("MAP2", "RBFOX3", "DLG4", "SYP")
+)
+stromal_all <- unlist(stromal)
+
+##Immune
+immune <- list(
+B_cells = c("PAX5", "MS4A1", "CD19", "IGLL5", "VPREB3"),
+GC_B_cells = c("SERPINA9", "HRK", "HTR3A", "TCL6", "CD180", "FCRLA"),
+Plasma_B_cells = c("SSR4", "IGLL5", "IGLL1", "AMPD1"),
+Mast_cells = c("TPSAB1", "HDC", "CTSG", "CMA1", "KRT1", "IL1RAPL1", "GATA2"),
+CD69pos_Mast = c("CMA1", "IL1RAPL1", "CD69"),
+NK = c("KLRF1", "SH2D1B", "SH2D1B", "NCAM1", "FCGR3A"),
+Monocytes_macrophages = c("CD14", "CLEC9A", "FCGR1A", "LILRB2", "CD209", "CD1E", "FOLR2","FABP3","PLA2G2D"),
+T_cells = c("CD3D", "CD3E", "CD3G", "CD8A", "CD8B", "TBX21", "IL7R", "CD4", "CD2"),
+Tregs = c("BATF","TNFRSF4", "FOXP3","CTLA4","LAIR2"),
+T_memory = c("BACH2", "IFNG", "STIM2", "ID2", "IFNAR1", "IL12RB2", "PTPRC"),
+T_naive = c("CCR7", "CD28", "ETS1"),
+activated_CD4 = c("IL4R", "STAT1", "MAL", "SOCS1", "IL2", "ODC1", "WARS"),
+T_activated = c("TNF", "IFNG", "JUN", "FOS", "CD69", "REL"),
+Th17_CD4 = c("IL17A", "CTSH", "KLRB1", "IL26"),
+T_exhauseted = c("PDCD1", "HAVCR2", "LAG3","CD101", "CD38", "CXCR6", "TIGIT"),
+T_term_exhausted = c("TOX", "GZMB", "ENTPD1", "ITGAE")
+)
+immune_all <- unlist(immune)
+
+#Epithelial
+epithel <- list(
+CyclingTA = c("TICRR","CDC25C"),
+ImmatureEnterocytes = c("SLC26A2","CA1"),
+Tuft = c("GNG13","SH2D7","SH2D6","TRPM5","AZGP1","KRT18","BMX","PSTPIP2","LRMP","PTGS1","IL17RB","HCK","PLCG2","ANXA13"),
+Best4posEnterocytes = c("BEST4", "CA7","OTOP2","OTOP3", "MYOM1","MT1G","MT1H"),
+General_Epithelial = c("EPCAM", "KRT8","KRT18"),
+Immature_Goblet = c("KLK1","ITLN1","WFDC2","CLCA1","LRRC26","RETNLB","SPINK4","AGR2"),
+Goblet = c("MUC2", "TFF1", "FCGBP","FFAR4","SYTL2","LGALS9B","BCAS1"),
+Stem = c("SMOC2", "RGMB", "LGR5", "ASCL2", "SOX9", "CD34"),
+Enteroendocrine = c("CRYBA2","SCGN","FEV","CHGA","GCG","SCG5","PCSK1N","PYY","NEUROD1","MS4A8","DDC")
+)
+epithel_all <- unlist(epithel)
+
+#Plot score for each tissue type
+dat <- AddModuleScore(object = dat, features = list(stromal_all), name = "stromal_score")
+dat <- AddModuleScore(object = dat, features = list(immune_all), name = "immune_score")
+dat <- AddModuleScore(object = dat, features = list(epithel_all), name = "epithel_score")
+p1 <- FeaturePlot(object = dat, features = "stromal_score1",order=T)
+p2 <- FeaturePlot(object = dat, features = "immune_score1",order=T)
+p3 <- FeaturePlot(object = dat, features = "epithel_score1",order=T)
+grid.arrange(p1,p2,p3,ncol=3)
+```
+```{r, echo=T,results='hide',fig.keep='all'}
+#New cluster identities
+new.cluster.ids <- c(0,1,2,3,4,5,"immune",7,"epithel","stromal","immune",11,12,13,"epithel",15)
+names(new.cluster.ids) <- levels(dat)
+dat <- RenameIdents(dat, new.cluster.ids)
+DimPlot(dat, reduction = "umap", label = TRUE, pt.size = 0.5,cols = colors23) + NoLegend()
+```
+
+
+```{r, echo=T,results='hide',fig.keep='all'}
+#Differential expression for stroma
+stromal.cells <- subset(dat, idents = "stromal")
+Idents(stromal.cells) <- "disease"
+stroma_de <- FindMarkers(stromal.cells, ident.1 = "CRC", ident.2 = "Unaffected", verbose = FALSE)
+
+#Focus on human TFs
+human_tfs <- read.csv(file.path(wd,"human_tfs.csv"),header=F)
+ind <- rownames(stroma_de) %in% human_tfs$V1
+stroma_de_tfs <- stroma_de[ind,]
+head(stroma_de_tfs, n = 20)
+```
+```{r, echo=T,results='hide',fig.keep='all'}
+plots <- VlnPlot(stromal.cells, features = rownames(stroma_de_tfs)[1:6], split.by = "disease", 
+                 pt.size = 0,combine=T)
+plots
+```
+```{r, echo=T,results='hide',fig.keep='all'}
+#Save processed and integrated data
+saveRDS(dat,file.path(wd,"rna-integrated.rds"))
+```
+
+## 5. Seurat analysis of scATAC-seq data
+
+The output of `cellranger aggr` function will be loaded into R using `Seurat`.
+```{r, echo=T,results='hide',fig.keep='all'}
+# Load packages and data
+library(Seurat)
+library(Signac)
+library(SeuratDisk)
+library(EnsDb.Hsapiens.v86)
+library(biovizBase)
+library(GenomeInfoDb)
+library(patchwork)
+library(harmony)
+library(ggplot2)
+library(gridExtra)
+
+#Load meta data
+meta <- read.table(file.path(wd,"samplesheet.tab"),header = T)
+meta <- meta[meta$Assay=="ATAC-seq",]
+
+file <- file.path(wd,"scATAC-aggr/outs/filtered_peak_bc_matrix.h5")
+input <- Read10X_h5(file)
+
+#Remove mouse peaks
+mouse <- grepl("mm10_",rownames(input))
+input <- input[!mouse,]
+
+peakmeta <- read.csv(file.path(wd,"scATAC-aggr/outs/singlecell.csv"),header=T,row.names = 1)
+
+chrom_assay <- CreateChromatinAssay(
+  counts=input,
+  sep=c(":","-"),
+  fragments=file.path(wd,"scATAC-aggr/outs/fragments.tsv.gz"), #fragments need to match the annotation naming
+  min.cells=10,
+  min.features=200
+)
+
+#Create Seurat object
+dat <- CreateSeuratObject(counts = chrom_assay, project = "CRC", assay="peaks", meta.data = peakmeta)
+
+#Add sample information to data
+dat@meta.data$sample <- NULL
+dat@meta.data$sample[grepl("-1",rownames(dat@meta.data))] <- meta$SRR_ID[1]
+dat@meta.data$sample[grepl("-2",rownames(dat@meta.data))] <- meta$SRR_ID[2]
+dat@meta.data$sample[grepl("-3",rownames(dat@meta.data))] <- meta$SRR_ID[3]
+dat@meta.data$sample[grepl("-4",rownames(dat@meta.data))] <- meta$SRR_ID[4]
+
+dat@meta.data$disease <- NULL
+dat@meta.data$disease[grepl("-1",rownames(dat@meta.data))] <- meta$Disease_State[1]
+dat@meta.data$disease[grepl("-2",rownames(dat@meta.data))] <- meta$Disease_State[2]
+dat@meta.data$disease[grepl("-3",rownames(dat@meta.data))] <- meta$Disease_State[3]
+dat@meta.data$disease[grepl("-4",rownames(dat@meta.data))] <- meta$Disease_State[4]
+
+#Get gene ranges
+#annotations <- GetGRangesFromEnsDb(ensdb=EnsDb.Hsapiens.v86)
+annotations <- readRDS(file=file.path(wd,"annotations.rds"))
+
+seqlevels(annotations) <- paste0('GRCh38_chr', seqlevels(annotations))
+genome(annotations) <- "hg38"
+
+Annotation(dat) <- annotations
+
+dat <- NucleosomeSignal(object=dat) #fragment ratio 147-294: < 147
+
+#Calculate and visualize QC metrics
+dat <- TSSEnrichment(object=dat,fast=F)
+dat$blacklist_ratio <- dat$blacklist_region_fragments / dat$peak_region_fragments
+dat$pct_reads_in_peaks <- dat$peak_region_fragments_GRCh38 / dat$passed_filters_GRCh38 * 100
+
+plot <- VlnPlot(
+  object = dat,
+  features = c('peak_region_fragments_GRCh38', 'pct_reads_in_peaks',
+               'blacklist_ratio', 'nucleosome_signal','TSS.enrichment'),
+  pt.size=0
+)
+plot
+```
+```{r, echo=T,results='hide',fig.keep='all'}
+low_prf <- quantile(dat[["peak_region_fragments_GRCh38"]]$peak_region_fragments_GRCh38, probs=0.02)
+hig_prf <- quantile(dat[["peak_region_fragments_GRCh38"]]$peak_region_fragments_GRCh38, probs=0.98)
+hig_prp <- quantile(dat[["pct_reads_in_peaks"]]$pct_reads_in_peaks, probs=0.02)
+
+hig_blr <- quantile(dat[["blacklist_ratio"]]$blacklist_ratio, probs=0.98)
+hig_ns <- quantile(dat[["nucleosome_signal"]]$nucleosome_signal, probs=0.98)
+low_ts <- quantile(dat[["TSS.enrichment"]]$TSS.enrichment, probs=0.02)
+
+#Filter based on violin plots
+dat <- subset(
+  x=dat,subset= peak_region_fragments_GRCh38 > low_prf &
+    peak_region_fragments_GRCh38 < hig_prf &
+    pct_reads_in_peaks > hig_prp & blacklist_ratio <= hig_blr &
+    nucleosome_signal < hig_ns & TSS.enrichment > low_ts
+)
+
+#Pre-processing
+dat <- RunTFIDF(dat)
+dat <- FindTopFeatures(dat,min.cutoff = 20)
+
+#Dimensionality reduction
+dat <- RunSVD(dat)
+DepthCor(dat) #PC1 needs to be dropped
+```
+```{r, echo=T,results='hide',fig.keep='all'}
+dat <- RunUMAP(dat,reduction='lsi',dims=2:30)
+
+# Dimensional reduction plot
+DimPlot(dat, group.by = c('sample','disease'), label=T, pt.size = 0.5,order=T) + NoLegend()
+```
+```{r, echo=T,results='hide',fig.keep='all'}
+saveRDS(dat,file.path(wd,"atac-unintegrated.rds"))
+```
+```{r, echo=T,results='hide',fig.keep='all'}
+# Data integration
+set.seed(234)
+dat.int <- RunHarmony(object = dat, group.by.vars = 'sample',reduction.use='lsi',project.dim = FALSE)
+dat.int <- RunUMAP(dat.int, dims = 2:30, reduction = 'harmony')
+dat.int <- FindNeighbors(dat.int, reduction = 'lsi',dims=2:30)
+dat.int <- FindClusters(dat.int, verbose=FALSE, algorithm = 3)
+DimPlot(dat.int, group.by = c('sample','disease'), pt.size = 0.5)
+```
+```{r, echo=T,results='hide',fig.keep='all'}
+DimPlot(dat.int, pt.size = 0.5,label=TRUE,cols = colors23) + NoLegend()
+```
+```{r, echo=T,results='hide',fig.keep='all'}
+# Calculate gene activity
+## gene.activities <- GeneActivity(dat.int)
+## saveRDS(gene.activities,file="gene.activities.rds")
+gene.activities <- readRDS(file=file.path(wd,"gene.activities.rds"))
+
+dat.int[['RNA']] <- CreateAssayObject(counts=gene.activities)
+
+dat.int <- NormalizeData(
+  object = dat.int,
+  assay = 'RNA',
+  normalization.method = 'LogNormalize',
+  scale.factor = median(dat.int$nCount_RNA)
+)
+
+#Differential accessibilities
+DefaultAssay(dat.int) <- 'peaks'
+cof <- 6 #select cluster of choice
+
+da_peaks <- FindMarkers(dat.int,
+                        ident.1 = rownames(dat.int[[]][dat.int$disease == 'CRC' & dat.int$seurat_clusters==cof,]),
+                        ident.2 = rownames(dat.int[[]][dat.int$disease == 'Unaffected' & dat.int$seurat_clusters==cof,]),
+                        min.pct=0.05,
+                        test.use='LR',
+                        latent.vars='peak_region_fragments_GRCh38')
+rownames(da_peaks) <- gsub("GRCh38-","",rownames(da_peaks)) #GRCh38 prefix is a problem. Consider mapping to one species genome or rename input.
+da_peaks.gr <- GRanges(sub("-",":",rownames(da_peaks)))
+seqlevels(da_peaks.gr) <- paste0('GRCh38_', seqlevels(da_peaks.gr))
+
+##Add closest gene and its distance
+closest <- ClosestFeature(dat.int,regions=da_peaks.gr)
+ind <- gsub("GRCh38_","",closest$query_region) %in% rownames(da_peaks)
+da_peaks$closest_gene <- NA
+da_peaks$gene_distance <- NA
+da_peaks$closest_gene[ind] <- closest$gene_name
+da_peaks$gene_distance[ind] <- closest$distance
+head(da_peaks)
+```
+```{r, echo=T,results='hide',fig.keep='all'}
+##Subset DA regions by TFs
+human_tfs <- read.csv(file.path(wd,"human_tfs.csv"),header=F)
+ind <- da_peaks$closest_gene %in% human_tfs$V1
+da_tfs <- da_peaks[ind,]
+head(da_tfs, n = 20)
+```
+```{r, echo=T,results='hide',fig.keep='all'}
+## Plot example region
+CoveragePlot(dat.int,region=da_peaks.gr[ind,][1], #region needs to be coerced to Grange. See GRCh38 prefix issue above.
+             extend.upstream = 10000,
+             extend.downstream = 5000,
+             group.by="disease")
+```
+```{r, echo=T,results='hide',fig.keep='all'}
+saveRDS(dat.int,file.path(wd,"atac-integrated.rds"))
+```
+## 6. Integration of scATAC-seq with scRNA-seq data
+
+In this step useful information such as cell types will be transferred from scRNA-seq data to the scATAC-seq dataset using the the `FindTransferAnchors()`and `TransferData()` functions.
+```{r, echo=T,results='hide',fig.keep='all'}
+#Load scRNA-seq processed data
+dat.atac <- readRDS(file.path(wd,"atac-integrated.rds"))
+dat.rna <- readRDS(file.path(wd,"rna-integrated.rds"))
+DefaultAssay(dat.atac) <- 'RNA' #Change default assay of scATAC-seq data to RNA
+transfer.anchors <- FindTransferAnchors(
+  reference = dat.rna,
+  query=dat.atac,
+  reduction = 'cca'
+)
+
+predicted.labels <- TransferData(
+  anchorset = transfer.anchors,
+  refdata = dat.rna$seurat_clusters,
+  weight.reduction = dat.atac[['lsi']],
+  dims = 2:30
+)
+
+dat.atac <- AddMetaData(object = dat.atac, metadata = predicted.labels)
+
+plot1 <- DimPlot(
+  object = dat.rna,
+  group.by = 'seurat_clusters',cols=colors23,
+  label = TRUE,
+  repel = TRUE) + NoLegend() + ggtitle('scRNA-seq')
+
+plot2 <- DimPlot(
+  object = dat.atac,
+  group.by = 'predicted.id', cols=colors23,
+  label = TRUE,
+  repel = TRUE) + NoLegend() + ggtitle('scATAC-seq')
+
+plot1 + plot2
+```
+```{r, echo=T,results='hide',fig.keep='all'}
+# Replace each ATAC cluster label with most likely predicted label
+for(i in levels(dat.atac)) {
+  cells_to_reid <- WhichCells(dat.atac, idents = i)
+  newid <- names(which.max(table(dat.atac$predicted.id[cells_to_reid])))
+  Idents(dat.atac, cells = cells_to_reid) <- newid
+}
+saveRDS(dat.atac,file=file.path(wd,"atac-integrated-rna.rds"))
+```
