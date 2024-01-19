@@ -8,9 +8,6 @@ output: html_notebook
 ```{r setup, include=FALSE}
 knitr::opts_chunk$set(warning = FALSE, message = FALSE, echo=T) 
 ```
-
-# Task 1:
-
 ## 1. Defining input data
 
 A balanced cohort at the level of sex, disease state and single cell assay type will be randomly selected from full dataset. Metadata will be exported as `samplesheet.tab`. In addition, `aggr.rna` and `aggr.atac` samplesheets will be generated for later steps.
